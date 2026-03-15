@@ -1,6 +1,7 @@
 import html
 import json
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -114,6 +115,7 @@ def ensure_auth_session_state():
     st.session_state.setdefault("conversation_loaded", False)
     st.session_state.setdefault("current_conversation_id", "")
     st.session_state.setdefault("conversation_summaries", [])
+    st.session_state.setdefault("generated_titles", {})
 
 
 def apply_query_auth():
@@ -187,10 +189,53 @@ def supabase_request(method, path, payload=None, query="", extra_headers=None):
 
 # ─── Conversation helpers ─────────────────────────────────────────────────────
 
+def generate_conversation_title(message):
+    text = re.sub(r"\s+", " ", (message or "").strip())
+    if not text:
+        return "New Conversation"
+
+    first_chunk = re.split(r"[.!?\n:]", text, maxsplit=1)[0].strip() or text
+    words = first_chunk.split()
+    if not words:
+        return "New Conversation"
+
+    short = " ".join(words[:6]).strip(" -_,;")
+    if not short:
+        return "New Conversation"
+
+    if len(words) > 6 or len(first_chunk) > len(short):
+        return short[:40].rstrip(" -_,;") + "..."
+    return short[:40]
+
+
+def clean_generated_title(title, fallback):
+    text = re.sub(r"\s+", " ", (title or "").strip()).strip("\"'`")
+    text = re.sub(r"^[Tt]itle:\s*", "", text)
+    text = text[:60].strip(" -_,;:.")
+    return text or fallback
+
+
+def generate_ai_conversation_title(message, model):
+    fallback = generate_conversation_title(message)
+    prompt = (
+        "Create a short chat title for this cybersecurity conversation. "
+        "Return only the title, with no quotes, no punctuation at the end, and keep it under 7 words.\n\n"
+        f"User message: {message}"
+    )
+    title, _ = generate_response(
+        model,
+        "You create concise conversation titles.",
+        [{"role": "user", "content": prompt}],
+    )
+    if str(title).lower().startswith("groq request failed") or "not configured" in str(title).lower():
+        return fallback
+    return clean_generated_title(title, fallback)
+
+
 def load_conversation_summaries(user_id):
     from urllib.parse import quote
     query = (
-        "select=conversation_id,message,created_at"
+        "select=conversation_id,message,created_at,sender"
         f"&user_id=eq.{quote(user_id, safe='')}"
         "&order=created_at.desc"
     )
@@ -199,10 +244,15 @@ def load_conversation_summaries(user_id):
         return []
     seen = set()
     counts = {}
+    titles = {}
     for row in rows:
         cid = str(row.get("conversation_id", "")).strip()
         if cid:
             counts[cid] = counts.get(cid, 0) + 1
+            sender = str(row.get("sender", "")).strip().lower()
+            message = str(row.get("message", "")).strip()
+            if sender == "user" and message:
+                titles[cid] = generate_conversation_title(message)
     summaries = []
     for row in rows:
         cid = str(row.get("conversation_id", "")).strip()
@@ -212,7 +262,9 @@ def load_conversation_summaries(user_id):
         message = str(row.get("message", "")).strip()
         summaries.append({
             "conversation_id": cid,
-            "title": message[:32] + ("..." if len(message) > 32 else "") or "New Conversation",
+            "title": st.session_state.get("generated_titles", {}).get(cid)
+            or titles.get(cid)
+            or generate_conversation_title(message),
             "created_at": str(row.get("created_at", "")).strip(),
             "message_count": counts.get(cid, 0),
         })
@@ -457,60 +509,97 @@ def generate_response(model, system_prompt, api_messages):
 
 
 def render_sidebar_panel():
+    st.session_state.setdefault("conversation_summaries", [])
+    st.session_state.setdefault("current_conversation_id", "")
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("selected_domain", DOMAINS[0])
+
     if not st.session_state.sidebar_open:
-        if st.button(">", key="toggle_sidebar_closed", help="Open sidebar", use_container_width=True):
+        if st.button(">>", key="toggle_sidebar_closed", help="Open sidebar", use_container_width=True):
             st.session_state.sidebar_open = True
             st.rerun()
         return
-    header_cols = st.columns([1, 5])
+
+    header_cols = st.columns([5, 1], gap="small")
     with header_cols[0]:
-        if st.button("<", key="toggle_sidebar_open", help="Collapse sidebar", use_container_width=True):
-            st.session_state.sidebar_open = False
-            st.rerun()
-    with header_cols[1]:
         st.markdown(
-            "<div class='brand-row'><div class='brand-icon'>SC</div><div><div class='brand-name'>SecurCoach AI</div><div class='brand-sub'>Security Training</div></div></div>",
+            "<div class='brand-row'><div class='brand-icon'>SC</div>"
+            "<div><div class='brand-name'>SecurCoach AI</div>"
+            "<div class='brand-sub'>Security Training</div></div></div>",
             unsafe_allow_html=True,
         )
-    if st.button("+ New Conversation", key="new_conv", use_container_width=True):
+    with header_cols[1]:
+        if st.button("<<", key="toggle_sidebar_open", help="Collapse sidebar", use_container_width=True):
+            st.session_state.sidebar_open = False
+            st.rerun()
+
+    st.markdown("<div class='section-label'>Study Domain</div>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSelectbox"] input {
+            pointer-events: none !important;
+            caret-color: transparent !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.session_state.selected_domain = st.selectbox(
+        "Domain",
+        DOMAINS,
+        index=DOMAINS.index(st.session_state.selected_domain) if st.session_state.selected_domain in DOMAINS else 0,
+        key="domain_select",
+        label_visibility="collapsed",
+    )
+
+    st.markdown("<div style='margin-bottom: 1rem;'></div>", unsafe_allow_html=True)
+
+    if st.button("+ New Conversation", key="new_conv", use_container_width=True, type="primary"):
         create_new_conversation()
         refresh_conversations()
         st.rerun()
+
+    st.markdown("<div style='margin-bottom: 0.5rem;'></div>", unsafe_allow_html=True)
     st.markdown("<div class='history-label'>Chat History</div>", unsafe_allow_html=True)
+
     if st.session_state.conversation_summaries:
         for summary in st.session_state.conversation_summaries:
             cid = summary["conversation_id"]
             created_at = summary["created_at"].replace("T", " ")[:16] if summary["created_at"] else ""
-            cols = st.columns([6, 1])
+            cols = st.columns([8, 2], gap="small")
             with cols[0]:
+                is_active = cid == st.session_state.current_conversation_id
+                btn_label = f"[Active] {summary['title']}" if is_active else summary["title"]
                 if st.button(
-                    summary["title"],
+                    btn_label,
                     key=f"conv_{cid}",
                     use_container_width=True,
-                    help=f"{created_at} · {summary['message_count']} messages",
+                    help=f"{created_at} - {summary['message_count']} messages",
                 ):
                     select_conversation(cid)
                     st.rerun()
-                meta = f"{created_at} · {summary['message_count']} messages".strip(" ·")
+                meta = f"{created_at} - {summary['message_count']} msgs".strip(" -")
                 if meta:
                     st.markdown(f"<div class='conv-meta'>{html.escape(meta)}</div>", unsafe_allow_html=True)
             with cols[1]:
-                if st.button("X", key=f"del_{cid}", help="Delete"):
-                    delete_conversation(cid)
-                    if cid == st.session_state.current_conversation_id:
-                        st.session_state.current_conversation_id = ""
-                        st.session_state.messages = []
-                    refresh_conversations()
-                    if not st.session_state.current_conversation_id:
-                        if st.session_state.conversation_summaries:
-                            select_conversation(
-                                st.session_state.conversation_summaries[0]["conversation_id"]
-                            )
-                        else:
-                            create_new_conversation()
-                    st.rerun()
+                with st.popover("...", help="Actions", use_container_width=True):
+                    st.markdown("<div class='chat-action-menu-label'>Delete</div>", unsafe_allow_html=True)
+                    if st.button("Delete", key=f"del_{cid}", use_container_width=True):
+                        delete_conversation(cid)
+                        if cid == st.session_state.current_conversation_id:
+                            st.session_state.current_conversation_id = ""
+                            st.session_state.messages = []
+                        refresh_conversations()
+                        if not st.session_state.current_conversation_id:
+                            if st.session_state.conversation_summaries:
+                                select_conversation(st.session_state.conversation_summaries[0]["conversation_id"])
+                            else:
+                                create_new_conversation()
+                        st.rerun()
     else:
         st.markdown("<div class='chat-rail-empty'>No past conversations yet.</div>", unsafe_allow_html=True)
+
 
 
 def render_messages():
@@ -524,7 +613,6 @@ def render_messages():
         return
     for msg in st.session_state.messages:
         render_message(msg)
-
 
 def render_message(msg):
     is_user = msg["role"] == "user"
@@ -566,12 +654,19 @@ def build_system_prompt():
 
 
 def handle_prompt(prompt):
+    is_new_conversation = not st.session_state.current_conversation_id
     if not st.session_state.current_conversation_id:
         create_new_conversation()
+    conversation_id = st.session_state.current_conversation_id
     append_message("user", prompt, datetime.now().strftime("%H:%M"))
+    if is_new_conversation:
+        st.session_state.generated_titles[conversation_id] = generate_conversation_title(prompt)
     refresh_conversations()
     st.session_state.pending_prompt = {
+        "conversation_id": conversation_id,
         "model": st.session_state.selected_model,
+        "generate_title": is_new_conversation,
+        "title_source": prompt,
         "system_prompt": build_system_prompt(),
         "api_messages": [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
     }
@@ -594,6 +689,17 @@ def handle_prompt(prompt):
     }
 
 
+def extract_chat_submission(chat_value):
+    if chat_value is None:
+        return "", []
+    if isinstance(chat_value, str):
+        return chat_value, []
+    return (
+        getattr(chat_value, "text", "") or "",
+        list(getattr(chat_value, "files", []) or []),
+    )
+
+
 def render_dashboard():
     load_dashboard_css()
     render_chat_input_layout_css()
@@ -607,7 +713,14 @@ def render_dashboard():
         if st.session_state.get("supabase_error"):
             st.caption("⚠️ Supabase sync failed on the last request.")
         render_messages()
-        prompt = st.chat_input("Ask a security question...", key="chat_input")
+        chat_value = st.chat_input(
+            "Ask a security question...",
+            key="chat_input",
+            accept_file=True,
+        )
+        prompt, uploaded_files = extract_chat_submission(chat_value)
+        if uploaded_files:
+            st.caption(f"{len(uploaded_files)} file(s) attached.")
         if prompt and not st.session_state.get("is_generating", False):
             handle_prompt(prompt)
 
@@ -617,6 +730,11 @@ def render_dashboard():
             with assistant_slot.container():
                 render_loading_message()
             with st.spinner("SecurCoach AI is generating a response..."):
+                if pending.get("generate_title") and pending.get("conversation_id"):
+                    st.session_state.generated_titles[pending["conversation_id"]] = generate_ai_conversation_title(
+                        pending.get("title_source", ""),
+                        pending["model"],
+                    )
                 reply, usage_tokens = generate_response(
                     pending["model"],
                     pending["system_prompt"],
