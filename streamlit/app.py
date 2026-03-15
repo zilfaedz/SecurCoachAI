@@ -30,7 +30,7 @@ DOMAINS = [
     "Cryptography",
     "Incident Response",
 ]
-MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-flash-latest"]
+MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 
 st.set_page_config(
     page_title="SecurCoach AI",
@@ -62,8 +62,8 @@ def get_secret_value(key, default=""):
 def get_react_app_url():
     return get_secret_value("REACT_APP_URL", "http://localhost:3000")
 
-def get_gemini_api_key():
-    return get_secret_value("GEMINI_API_KEY", "")
+def get_groq_api_key():
+    return get_secret_value("GROQ_API_KEY", "")
 
 def get_supabase_url():
     return get_secret_value("SUPABASE_URL", "")
@@ -390,83 +390,70 @@ def render_login_redirect_notice():
 
 
 def generate_response(model, system_prompt, api_messages):
-    api_key = get_gemini_api_key()
+    api_key = get_groq_api_key()
     if not api_key:
-        return "Gemini is not configured. Add `GEMINI_API_KEY` to Streamlit secrets or your environment.", 0
+        return "Groq is not configured. Add `GROQ_API_KEY` to Streamlit secrets or your environment.", 0
 
-    contents = [
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(
         {
-            "role": "model" if m["role"] == "assistant" else "user",
-            "parts": [{"text": m["content"]}],
+            "role": "assistant" if m["role"] == "assistant" else "user",
+            "content": m["content"],
         }
         for m in api_messages
-    ]
+    )
     payload = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": contents,
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_completion_tokens": 1024,
     }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    url = "https://api.groq.com/openai/v1/chat/completions"
 
-    for candidate_model in [model, "gemini-2.0-flash", "gemini-flash-latest"]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent?key={api_key}"
-        for attempt in range(2):
-            try:
-                if USE_REQUESTS:
-                    resp = http_requests.post(url, json=payload, timeout=60)
-                    if resp.status_code == 503 and attempt == 0:
+    for attempt in range(2):
+        try:
+            if USE_REQUESTS:
+                resp = http_requests.post(url, json=payload, headers=headers, timeout=60)
+                if resp.status_code >= 500 and attempt == 0:
+                    time.sleep(1.2)
+                    continue
+                if resp.status_code != 200:
+                    return f"Groq request failed ({resp.status_code}). {resp.text}", 0
+                data = resp.json()
+            else:
+                from urllib import error as _error, request as _req
+                req = _req.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                try:
+                    with _req.urlopen(req, timeout=60) as response:
+                        data = json.loads(response.read().decode("utf-8"))
+                except _error.HTTPError as exc:
+                    details = exc.read().decode("utf-8", errors="replace")
+                    if exc.code >= 500 and attempt == 0:
                         time.sleep(1.2)
                         continue
-                    if resp.status_code != 200:
-                        if resp.status_code != 503:
-                            return f"Gemini request failed ({resp.status_code}). {resp.text}", 0
-                        break
-                    data = resp.json()
-                else:
-                    from urllib import error as _error, request as _req
-                    req = _req.Request(
-                        url,
-                        data=json.dumps(payload).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    try:
-                        with _req.urlopen(req, timeout=60) as response:
-                            data = json.loads(response.read().decode("utf-8"))
-                    except _error.HTTPError as exc:
-                        details = exc.read().decode("utf-8", errors="replace")
-                        if exc.code == 503 and attempt == 0:
-                            time.sleep(1.2)
-                            continue
-                        if exc.code != 503:
-                            return f"Gemini request failed ({exc.code}). {details}", 0
-                        break
+                    return f"Groq request failed ({exc.code}). {details}", 0
 
-                parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                text = "\n".join(
-                    part.get("text", "") for part in parts if part.get("text")
-                ).strip() or "Gemini returned an empty answer."
-                return text, data.get("usageMetadata", {}).get("totalTokenCount", 0)
+            choice = (data.get("choices") or [{}])[0]
+            text = (
+                choice.get("message", {}).get("content", "") or "Groq returned an empty answer."
+            ).strip()
+            usage = data.get("usage", {})
+            total_tokens = usage.get("total_tokens", 0)
+            return text, total_tokens
 
-            except Exception as exc:
-                return f"Gemini request failed. {exc}", 0
+        except Exception as exc:
+            return f"Groq request failed. {exc}", 0
 
-    return "Gemini is temporarily unavailable. Please try again in a few moments.", 0
-
-
-def process_pending_prompt():
-    pending = st.session_state.get("pending_prompt")
-    if not pending:
-        return
-    reply, usage_tokens = generate_response(
-        pending["model"], pending["system_prompt"], pending["api_messages"]
-    )
-    append_message("assistant", reply, datetime.now().strftime("%H:%M"))
-    st.session_state.total_tokens += usage_tokens
-    st.session_state.total_interactions += 1
-    st.session_state.pending_prompt = None
-    st.session_state.is_generating = False
-    refresh_conversations()
-    st.rerun()
+    return "Groq is temporarily unavailable. Please try again in a few moments.", 0
 
 
 def render_sidebar_panel():
@@ -536,18 +523,22 @@ def render_messages():
         )
         return
     for msg in st.session_state.messages:
-        is_user = msg["role"] == "user"
-        row_cls = "user-row" if is_user else "ai-row"
-        av_cls = "user-av" if is_user else "ai-av"
-        av_lbl = "ME" if is_user else "AI"
-        bub_cls = "user-bubble" if is_user else "ai-bubble"
-        safe = html.escape(msg["content"]).replace("\n", "<br>")
-        st.markdown(
-            f"<div class='msg-row {row_cls}'><div class='avatar {av_cls}'>{av_lbl}</div>"
-            f"<div class='bubble {bub_cls}'>{safe}"
-            f"<div class='bubble-ts'>{html.escape(msg.get('timestamp', ''))}</div></div></div>",
-            unsafe_allow_html=True,
-        )
+        render_message(msg)
+
+
+def render_message(msg):
+    is_user = msg["role"] == "user"
+    row_cls = "user-row" if is_user else "ai-row"
+    av_cls = "user-av" if is_user else "ai-av"
+    av_lbl = "ME" if is_user else "AI"
+    bub_cls = "user-bubble" if is_user else "ai-bubble"
+    safe = html.escape(msg["content"]).replace("\n", "<br>")
+    st.markdown(
+        f"<div class='msg-row {row_cls}'><div class='avatar {av_cls}'>{av_lbl}</div>"
+        f"<div class='bubble {bub_cls}'>{safe}"
+        f"<div class='bubble-ts'>{html.escape(msg.get('timestamp', ''))}</div></div></div>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_loading_message():
@@ -558,12 +549,35 @@ def render_loading_message():
     )
 
 
+def build_system_prompt():
+    return (
+        f"You are SecurCoach AI, an expert cybersecurity assistant specializing in {st.session_state.selected_domain}. "
+        "Your role is to explain cybersecurity topics clearly and helpfully. "
+        "Follow these guidelines:\n"
+        "1. Use the NIST Cybersecurity Framework as a reference when applicable.\n"
+        "2. Provide clear explanations with real-world examples and analogies.\n"
+        "3. When relevant, include short code snippets for defensive techniques.\n"
+        "4. Never provide instructions that could be used offensively or to harm systems.\n"
+        "5. If a question is outside cybersecurity, politely redirect to security topics.\n"
+        "6. Keep responses concise but thorough.\n"
+        "7. Do not quiz the user, ask practice questions, or give tests unless the user explicitly asks for a quiz, reviewer, or practice mode.\n"
+        "8. Answer the user's exact question directly before offering any optional extra help."
+    )
+
+
 def handle_prompt(prompt):
     if not st.session_state.current_conversation_id:
         create_new_conversation()
     append_message("user", prompt, datetime.now().strftime("%H:%M"))
     refresh_conversations()
     st.session_state.pending_prompt = {
+        "model": st.session_state.selected_model,
+        "system_prompt": build_system_prompt(),
+        "api_messages": [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
+    }
+    st.session_state.is_generating = True
+    st.rerun()
+    return {
         "model": st.session_state.selected_model,
         "system_prompt": (
             f"You are SecurCoach AI, an expert cybersecurity training coach specializing in {st.session_state.selected_domain}. "
@@ -578,8 +592,6 @@ def handle_prompt(prompt):
         ),
         "api_messages": [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
     }
-    st.session_state.is_generating = True
-    st.rerun()
 
 
 def render_dashboard():
@@ -595,14 +607,29 @@ def render_dashboard():
         if st.session_state.get("supabase_error"):
             st.caption("⚠️ Supabase sync failed on the last request.")
         render_messages()
-        if st.session_state.is_generating:
-            render_loading_message()
-            with st.spinner("SecurCoach AI is generating a response..."):
-                process_pending_prompt()
-            return
         prompt = st.chat_input("Ask a security question...", key="chat_input")
-        if prompt:
+        if prompt and not st.session_state.get("is_generating", False):
             handle_prompt(prompt)
+
+        pending = st.session_state.get("pending_prompt")
+        if pending and st.session_state.get("is_generating", False):
+            assistant_slot = st.empty()
+            with assistant_slot.container():
+                render_loading_message()
+            with st.spinner("SecurCoach AI is generating a response..."):
+                reply, usage_tokens = generate_response(
+                    pending["model"],
+                    pending["system_prompt"],
+                    pending["api_messages"],
+                )
+            append_message("assistant", reply, datetime.now().strftime("%H:%M"))
+            assistant_slot.empty()
+            render_message(st.session_state.messages[-1])
+            st.session_state.total_tokens += usage_tokens
+            st.session_state.total_interactions += 1
+            st.session_state.pending_prompt = None
+            st.session_state.is_generating = False
+            refresh_conversations()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
