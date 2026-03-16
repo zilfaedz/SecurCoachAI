@@ -422,6 +422,10 @@ def render_chat_input_layout_css():
     )
 
 
+def render_sidebar_toggle_script():
+    return
+
+
 # ─── UI Components ────────────────────────────────────────────────────────────
 
 def render_login_redirect_notice():
@@ -513,11 +517,14 @@ def render_sidebar_panel():
     st.session_state.setdefault("current_conversation_id", "")
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("selected_domain", DOMAINS[0])
+    st.session_state.setdefault("open_history_actions", "")
 
     if not st.session_state.sidebar_open:
-        if st.button(">>", key="toggle_sidebar_closed", help="Open sidebar", use_container_width=True):
+        st.markdown("<div class='sidebar-toggle-wrap sidebar-toggle-wrap-collapsed'>", unsafe_allow_html=True)
+        if st.button("☰", key="toggle_sidebar_closed", help="Open sidebar", use_container_width=True):
             st.session_state.sidebar_open = True
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
         return
 
     header_cols = st.columns([5, 1], gap="small")
@@ -529,17 +536,26 @@ def render_sidebar_panel():
             unsafe_allow_html=True,
         )
     with header_cols[1]:
-        if st.button("<<", key="toggle_sidebar_open", help="Collapse sidebar", use_container_width=True):
+        st.markdown("<div class='sidebar-toggle-wrap sidebar-toggle-wrap-open'>", unsafe_allow_html=True)
+        if st.button("⟨", key="toggle_sidebar_open", help="Collapse sidebar", use_container_width=True):
             st.session_state.sidebar_open = False
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown(
+        "<div class='sidebar-note'>Choose a study domain, start a fresh thread, or reopen an earlier conversation.</div>",
+        unsafe_allow_html=True,
+    )
 
     st.markdown("<div class='section-label'>Study Domain</div>", unsafe_allow_html=True)
     st.markdown(
         """
         <style>
         [data-testid="stSelectbox"] input {
-            pointer-events: none !important;
-            caret-color: transparent !important;
+            display: none !important;
+        }
+        [data-baseweb="select"] {
+            cursor: pointer !important;
         }
         </style>
         """,
@@ -583,10 +599,15 @@ def render_sidebar_panel():
                 if meta:
                     st.markdown(f"<div class='conv-meta'>{html.escape(meta)}</div>", unsafe_allow_html=True)
             with cols[1]:
-                with st.popover("...", help="Actions", use_container_width=True):
+                is_menu_open = st.session_state.open_history_actions == cid
+                if st.button("⋯", key=f"history_actions_{cid}", help="Actions", use_container_width=True):
+                    st.session_state.open_history_actions = "" if is_menu_open else cid
+                    st.rerun()
+                if is_menu_open:
                     st.markdown("<div class='chat-action-menu-label'>Delete</div>", unsafe_allow_html=True)
                     if st.button("Delete", key=f"del_{cid}", use_container_width=True):
                         delete_conversation(cid)
+                        st.session_state.open_history_actions = ""
                         if cid == st.session_state.current_conversation_id:
                             st.session_state.current_conversation_id = ""
                             st.session_state.messages = []
@@ -706,7 +727,7 @@ def render_dashboard():
     if st.session_state.sidebar_open:
         col_sidebar, col_chat = st.columns([1, 3], gap="small")
     else:
-        col_sidebar, col_chat = st.columns([0.001, 1], gap="small")
+        col_sidebar, col_chat = st.columns([0.12, 0.88], gap="small")
     with col_sidebar:
         render_sidebar_panel()
     with col_chat:
